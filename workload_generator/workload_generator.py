@@ -12,12 +12,14 @@ limitations under the License.
 """
 
 from workload_generator.mocked_model.MockedModel import MockedModel
-from utils.utils import CommGroup, CommType
+from utils.utils import CommGroup, CommType, RankGenerator
+from utils.rank_mapper import get_rank_list_for_comm_group
 from log_analyzer.log import Workload, LogItem
 
 
 class WorkloadGenerator:
-    # generator = WorkloadGenerator
+    DEFAULT_ORDER = 'tp-cp-ep-dp-pp'
+
     def __init__(self, args, model: MockedModel) -> None:
         self.name = "workload_generator"
         self.args = args
@@ -25,9 +27,26 @@ class WorkloadGenerator:
         self.workload = Workload()
         self.epoch = 0
 
+        order = getattr(args, 'order', None) or WorkloadGenerator.DEFAULT_ORDER
+        self.rank_generator = RankGenerator(
+            tp=args.tensor_model_parallel_size,
+            ep=getattr(args, 'expert_model_parallel_size', 1),
+            dp=args.dp_num,
+            pp=args.pipeline_model_parallel,
+            cp=getattr(args, 'context_parallel_size', 1),
+            order=order,
+        )
+        self.workload.rank_generator = self.rank_generator
+
+    def get_ranks(self, comm_group, comm_group_size=None):
+        return get_rank_list_for_comm_group(
+            self.rank_generator, comm_group, comm_group_size
+        )
+
     def __call__(self):
         args = self.args
         self.workload = Workload()
+        self.workload.rank_generator = self.rank_generator
         self.init()
         self.workload.append(LogItem(comm_type=CommType.epoch_end))
         for i in range(args.epoch_num):
@@ -40,7 +59,20 @@ class WorkloadGenerator:
                     self.backward()
             self.step()
             self.workload.append(LogItem(comm_type=CommType.epoch_end))
+        self._fill_ranks()
         return self.workload
+
+    def _fill_ranks(self):
+        for item in self.workload.workload:
+            if item.ranks is not None:
+                continue
+            if item.comm_group is None:
+                continue
+            item.ranks = get_rank_list_for_comm_group(
+                self.rank_generator, item.comm_group, item.comm_group_size
+            )
+            if item.comm_group_size is None and item.ranks:
+                item.comm_group_size = len(item.ranks)
 
     def forward(self):
         pass

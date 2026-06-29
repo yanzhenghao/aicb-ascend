@@ -83,6 +83,16 @@
     </div>
 
     <div class="chart-container">
+        <h2>Communication Domain: Rank Connectivity Graph</h2>
+        <div id="domain_graph" style="width:100%; height:550px;"></div>
+    </div>
+
+    <div class="chart-container">
+        <h2>Communication Domain: Message Size by Group</h2>
+        <div id="domain_bar" style="width:100%; height:450px;"></div>
+    </div>
+
+    <div class="chart-container">
         <h2>Ratio Pie</h2>
         <div id="all_ratio_pie" style="width:100%; height:400px;"></div>
     </div>
@@ -104,6 +114,12 @@
 
             var scatterByGroup = echarts.init(document.getElementById('scatter_by_group'));
             scatterByGroup.setOption({{ scatter_by_group_js | safe }});
+
+            var domainGraph = echarts.init(document.getElementById('domain_graph'));
+            domainGraph.setOption({{ domain_graph_js | safe }});
+
+            var domainBar = echarts.init(document.getElementById('domain_bar'));
+            domainBar.setOption({{ domain_bar_js | safe }});
 
             var allRatioPie = echarts.init(document.getElementById('all_ratio_pie'));
             allRatioPie.setOption({{ all_ratio_pie | safe }});
@@ -135,6 +151,8 @@
             scatterByCommtype.resize();
             cdfChart.resize();
             scatterByGroup.resize();
+            domainGraph.resize();
+            domainBar.resize();
             timelineChart.resize();
             ratioPie.resize();
             allRatioPie.resize();
