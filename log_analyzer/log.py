@@ -15,11 +15,14 @@ import os,math
 import pickle
 import csv
 import dataclasses
+import logging
 import numpy as np
 from typing import Union, Dict, List
 from utils.utils import CommType, CommGroup
 from log_analyzer.utils import convert_size_to_msg, calc_bw_log
 import copy
+
+logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class LogItem:
@@ -37,6 +40,7 @@ class LogItem:
     algbw: float = dataclasses.field(default=None)
     busbw: float = dataclasses.field(default=None)
     count: float = dataclasses.field(default=1)
+    ranks: list = dataclasses.field(default=None)
 
     @property
     def elapsed_time(self) -> float:
@@ -72,7 +76,17 @@ class LogItem:
         return ",".join([k for k in self.__dict__.keys()])
 
     def view_as_csv_line(self):
-        return ",".join([str(getattr(self, k)) for k in self.__dict__.keys()])
+        parts = []
+        for k in self.__dict__.keys():
+            v = getattr(self, k)
+            if k == 'ranks':
+                if v is not None:
+                    parts.append('"' + ','.join(str(r) for r in v) + '"')
+                else:
+                    parts.append('')
+            else:
+                parts.append(str(v))
+        return ','.join(parts)
 
     def __str__(self):
         if self.is_workload():
@@ -290,6 +304,37 @@ class Workload:
             filename = os.path.basename(filename).split(".")[0]
         filename = os.path.join("results/mocked_workload/", filename)
         csv_filename = filename + "_workload.csv"
+
+        rank_gen = getattr(self, 'rank_generator', None)
+
+        if rank_gen is not None:
+            from utils.rank_mapper import get_rank_list_for_comm_group, build_rank_mapping_table
+            for log_item in self.workload:
+                if log_item.ranks is not None:
+                    continue
+                if log_item.comm_group is None:
+                    continue
+                log_item.ranks = get_rank_list_for_comm_group(
+                    rank_gen, log_item.comm_group, log_item.comm_group_size
+                )
+                if log_item.comm_group_size is None and log_item.ranks:
+                    log_item.comm_group_size = len(log_item.ranks)
+                logger.warning(
+                    "Rank auto-populated at dump time for LogItem stage=%s, comm_group=%s.",
+                    log_item.stage, log_item.comm_group.value,
+                )
+
+            mapping_rows = build_rank_mapping_table(rank_gen)
+            sidecar_filename = filename + "_rank_mapping.csv"
+            with open(sidecar_filename, "w") as sf:
+                sf.write("group,size,rank_groups\n")
+                for row in mapping_rows:
+                    rank_groups_quoted = '"' + row["rank_groups"] + '"'
+                    sf.write(f"{row['group']},{row['size']},{rank_groups_quoted}\n")
+            print(f"Rank mapping file generated:{sidecar_filename}")
+        else:
+            logger.warning("No rank_generator available; skipping rank population and sidecar.")
+
         with open(csv_filename, "w") as f:
             f.write(self.workload[0].csv_header() + "\n")
             for log_item in self.workload:

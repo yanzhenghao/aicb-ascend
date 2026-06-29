@@ -1,6 +1,6 @@
 
 from log_analyzer.log import *
-from pyecharts.charts import Pie,Scatter,Line
+from pyecharts.charts import Pie,Scatter,Line,Graph,Bar
 from pyecharts import options as opts
 from typing import List, Dict
 import random
@@ -466,9 +466,61 @@ def create_ratio_pie(epoch_data):
     total_ratio_pie.set_series_opts(label_opts=opts.LabelOpts(formatter="{b}: {d}%"))
     return total_ratio_pie
 
+def extract_ranks_data(raw_rows):
+    domain_edges = defaultdict(lambda: defaultdict(int))
+    domain_msg_total = defaultdict(int)
+    domain_msg_count = defaultdict(int)
+    for row in raw_rows:
+        cg_raw = row.get('comm_group', 'None')
+        if cg_raw == 'None' or cg_raw == '':
+            continue
+        group_name = cg_raw.split('.')[-1] if '.' in cg_raw else cg_raw
+        msg_size = parse_msg_size(row.get('msg_size', '0'))
+        ranks_str = row.get('ranks', '')
+        if ranks_str:
+            ranks = [int(r) for r in ranks_str.split(',') if r.strip()]
+            for i in range(len(ranks)):
+                for j in range(i + 1, len(ranks)):
+                    edge = (min(ranks[i], ranks[j]), max(ranks[i], ranks[j]))
+                    domain_edges[group_name][edge] += 1
+        domain_msg_total[group_name] += msg_size
+        domain_msg_count[group_name] += 1
+    return {'edges': domain_edges, 'msg_total': domain_msg_total, 'msg_count': domain_msg_count}
+
+
+def create_domain_flow_graph(domain_ranks):
+    graph = Graph(init_opts=opts.InitOpts(width="100%", height="500px"))
+    all_ranks = set()
+    categories = []
+    links = []
+    group_colors = {'tp_group': '#376AB3', 'dp_group': '#87C0CA', 'pp_group': '#8cc540', 'ep_group': '#E8EDB9', 'ep_dp_group': '#f4a261', 'ep_tp_group': '#e76f51'}
+    for group_name, edges in domain_ranks['edges'].items():
+        color = group_colors.get(group_name, '#999999')
+        if group_name not in [c['name'] for c in categories]:
+            categories.append({'name': group_name, 'itemStyle': {'color': color}})
+        for (src, dst), count in edges.items():
+            all_ranks.add(src); all_ranks.add(dst)
+            links.append({'source': str(src), 'target': str(dst), 'value': count, 'lineStyle': {'color': color, 'curveness': 0.15, 'opacity': 0.6}})
+    nodes = [{'name': str(r), 'symbolSize': 20, 'category': 0} for r in sorted(all_ranks)]
+    graph.add("", nodes, links, categories, repulsion=200, edge_length=150, is_draggable=True, label_opts=opts.LabelOpts(is_show=True, position="inside"))
+    graph.set_global_opts(title_opts=opts.TitleOpts(title="Communication Domain: Rank Connectivity Graph"), legend_opts=opts.LegendOpts(type_="scroll", pos_left="80%", orient="vertical"))
+    return graph
+
+
+def create_domain_msg_size_bar(domain_ranks):
+    bar = Bar(init_opts=opts.InitOpts(width="100%", height="400px"))
+    groups = list(domain_ranks['msg_total'].keys())
+    totals = [domain_ranks['msg_total'][g] for g in groups]
+    bar.add_xaxis(groups)
+    bar.add_yaxis("Total Bytes", totals, label_opts=opts.LabelOpts(formatter="{c}"), itemstyle_opts=opts.ItemStyleOpts(color='#376AB3'))
+    bar.set_global_opts(title_opts=opts.TitleOpts(title="Communication Domain: Total Message Size by Group"), xaxis_opts=opts.AxisOpts(name="Comm Group", axislabel_opts=opts.LabelOpts(rotate=30)), yaxis_opts=opts.AxisOpts(name="Total Bytes"))
+    return bar
+
+
 def visualize_output(filepath,only_workload:bool):
-    
+
     log_items = read_csv_and_structure_data(filepath,only_workload)
+    raw_rows = list(custom_csv_reader(filepath, only_workload))
 
     #pie
     data_by_epoch_comm = split_data_by_epoch(1,log_items) #only comm
@@ -488,6 +540,10 @@ def visualize_output(filepath,only_workload:bool):
     #group Scatter
     effect_scatter_by_group = create_scatter_chart("group",data)
 
+    #ranks-based domain charts
+    domain_ranks = extract_ranks_data(raw_rows)
+    domain_graph = create_domain_flow_graph(domain_ranks)
+    domain_bar = create_domain_msg_size_bar(domain_ranks)
 
     #comp-comm pattern
     data_by_epoch = split_data_by_epoch(0, log_items)
@@ -514,7 +570,9 @@ def visualize_output(filepath,only_workload:bool):
         'timeline_charts_js': json.dumps(timeline_charts),
         'ratio_pies_js': json.dumps(ratio_pies),
         'iteration_count': len(all_iterations) if not only_workload else 0,
-        'all_ratio_pie':all_ratio_pie.dump_options() if all_ratio_pie else None, 
+        'all_ratio_pie':all_ratio_pie.dump_options() if all_ratio_pie else None,
+        'domain_graph_js': domain_graph.dump_options(),
+        'domain_bar_js': domain_bar.dump_options(),
     }
 
     # read Example.html
