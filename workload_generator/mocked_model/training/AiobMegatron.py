@@ -15,10 +15,21 @@ import torch
 import time
 import warnings
 import torch.nn.functional as F
-from apex.contrib.layer_norm.layer_norm import FastLayerNormFN
 import math
-import scaled_upper_triang_masked_softmax_cuda
-from torch.cuda.amp import custom_bwd, custom_fwd
+# apex + the fused CUDA softmax kernel are CUDA-only (used by AIOB GPU operator
+# timing). Optional on CPU / CUDA-free installs (aicb-ascend).
+try:
+    from apex.contrib.layer_norm.layer_norm import FastLayerNormFN
+except ImportError:
+    FastLayerNormFN = None
+try:
+    import scaled_upper_triang_masked_softmax_cuda
+except ImportError:
+    scaled_upper_triang_masked_softmax_cuda = None
+try:
+    from torch.cuda.amp import custom_bwd, custom_fwd
+except ImportError:
+    custom_bwd = custom_fwd = None
 from utils.utils import *
 from core import grouped_gemm_util as gg
 try:

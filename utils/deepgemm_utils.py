@@ -1,12 +1,19 @@
 import torch
 from typing import Tuple, Generator
-import deep_gemm
 import enum
 import random
-from deep_gemm.testing import bench_kineto, calc_diff, count_bytes
-from deep_gemm.utils import (align, ceil_div,
-                             get_mk_alignment_for_contiguous_layout,
-                             per_block_cast_to_fp8, per_token_cast_to_fp8)
+# DeepGEMM is CUDA-only — optional on CPU / CUDA-free installs (aicb-ascend).
+try:
+    import deep_gemm
+    from deep_gemm.testing import bench_kineto, calc_diff, count_bytes
+    from deep_gemm.utils import (align, ceil_div,
+                                 get_mk_alignment_for_contiguous_layout,
+                                 per_block_cast_to_fp8, per_token_cast_to_fp8)
+except ImportError:
+    deep_gemm = None
+    bench_kineto = calc_diff = count_bytes = None
+    align = ceil_div = get_mk_alignment_for_contiguous_layout = None
+    per_block_cast_to_fp8 = per_token_cast_to_fp8 = None
 # from deep_gemm.jit_kernels.utils import get_m_alignment_for_contiguous_layout
 
 # From DeepGEMM/tests/generators.py

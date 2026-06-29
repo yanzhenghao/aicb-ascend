@@ -6,9 +6,16 @@ from utils.deepgemm_utils import *
 import torch.nn.functional as F
 import random
 from typing import Tuple
-import triton
 import numpy as np
-from flash_mla import flash_mla_with_kvcache, get_mla_metadata, flash_mla_sparse_fwd
+# triton + FlashMLA are CUDA-only (GPU inference). Optional on CUDA-free installs.
+try:
+    import triton
+except ImportError:
+    triton = None
+try:
+    from flash_mla import flash_mla_with_kvcache, get_mla_metadata, flash_mla_sparse_fwd
+except ImportError:
+    flash_mla_with_kvcache = get_mla_metadata = flash_mla_sparse_fwd = None
 
 def to_float8(x, dtype=torch.float8_e4m3fn):
     finfo = torch.finfo(dtype)

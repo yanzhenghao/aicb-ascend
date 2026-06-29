@@ -153,19 +153,13 @@ linear_with_grad_accumulation_and_async_allreduce.warned = False
 
 from utils.utils import cuda_timing_decorator, divide
 
-# needs deep_gemm from https://github.com/deepseek-ai/DeepGEMM
+# DeepGEMM is CUDA-only — optional on CPU / CUDA-free installs (aicb-ascend).
 try:
     import deep_gemm
     from deep_gemm import ceil_div
-except ImportError as e:
-    print("""
-        Needs deep_gemm from https://github.com/deepseek-ai/DeepGEMM
-        to install,
-           git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
-           cd DeepGEMM
-           ./install.sh
-    """)
-    raise e
+except ImportError:
+    deep_gemm = None
+    ceil_div = None
 
 
 # from deepgemm/tests

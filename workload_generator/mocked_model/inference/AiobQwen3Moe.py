@@ -8,11 +8,16 @@ import random
 from typing import Optional, Union, Tuple
 # import triton
 import numpy as np
-from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
-from vllm import _custom_ops as vllm_ops
-from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
-import flashinfer
+# vLLM + flashinfer are CUDA-only (GPU inference). Optional on CUDA-free installs.
+try:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
+    from vllm import _custom_ops as vllm_ops
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
+    from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
+    import flashinfer
+except ImportError:
+    per_token_group_quant_fp8 = vllm_ops = None
+    RotaryEmbedding = get_rope = fused_topk = flashinfer = None
 
 # from benchmark_rmsnorm.py
 def rmsnorm_vllm(

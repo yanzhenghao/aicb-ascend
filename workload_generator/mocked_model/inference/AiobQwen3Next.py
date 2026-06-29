@@ -9,17 +9,30 @@ import random
 from typing import Optional, Union, Tuple
 # import triton
 import numpy as np
-from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
-from vllm import _custom_ops as vllm_ops
-from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
-from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-import flashinfer
-from vllm.model_executor.layers.fla.ops import (RMSNormGated, fused_recurrent_gated_delta_rule)
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
-    causal_conv1d_fn, causal_conv1d_update)
-from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+# vLLM + flashinfer are CUDA-only (GPU inference). Optional on CUDA-free installs.
+try:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
+    from vllm import _custom_ops as vllm_ops
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
+    from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+    import flashinfer
+    from vllm.model_executor.layers.fla.ops import (RMSNormGated, fused_recurrent_gated_delta_rule)
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        causal_conv1d_fn, causal_conv1d_update)
+    from vllm.platforms import current_platform
+    from vllm.triton_utils import tl, triton
+except ImportError:
+    per_token_group_quant_fp8 = vllm_ops = RotaryEmbedding = get_rope = None
+    fused_topk = GemmaRMSNorm = flashinfer = RMSNormGated = None
+    fused_recurrent_gated_delta_rule = causal_conv1d_fn = causal_conv1d_update = None
+    current_platform = tl = None
+
+    class _NoTriton:  # CUDA-free stub so module-level @triton.jit still imports
+        @staticmethod
+        def jit(fn=None, **kw):
+            return fn if callable(fn) else (lambda f: f)
+    triton = _NoTriton()
 
 def GemmaRMSNormTest(
         hidden_size,
