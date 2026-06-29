@@ -259,7 +259,7 @@ class SIMAI_workload:
                     dp_comm_size=0,
                 )
             )
-        if self.self.args.tensor_model_parallel_size == 1 :
+        if self.args.tensor_model_parallel_size == 1 :
             emd_backward_comm = "NONE"
         else:
             emd_backward_comm = "ALLREDUCE"
@@ -864,7 +864,7 @@ class SIMAI_workload:
 
         pp_comm_value = 2 * self.args.micro_batch * self.args.seq_length * self.args.hidden_size
         if self.args.enable_sequence_parallel:
-            pp_comm_value /= self.self.args.tensor_model_parallel_size
+            pp_comm_value /= self.args.tensor_model_parallel_size
 
         pp_comm = (
             f"pp_comm: {pp_comm_value}"
@@ -873,7 +873,7 @@ class SIMAI_workload:
         )
         with open(filename, "w") as f:
             f.write((
-                f"HYBRID_TRANSFORMER_FWD_IN_BCKWD model_parallel_NPU_group: {self.self.args.tensor_model_parallel_size} "
+                f"HYBRID_TRANSFORMER_FWD_IN_BCKWD model_parallel_NPU_group: {self.args.tensor_model_parallel_size} "
                 f"ep: {self.args.expert_model_parallel_size} "
                 f"pp: {self.args.pipeline_model_parallel} "
                 f"vpp: {self.args.num_layers} "
@@ -940,7 +940,7 @@ class simAI_MicroTest:
                     )
             else:
                 f.write(
-                    f"HYBRID_TRANSFORMER_FWD_IN_BCKWD	model_parallel_NPU_group: {self.self.args.tensor_model_parallel_size} \
+                    f"HYBRID_TRANSFORMER_FWD_IN_BCKWD	model_parallel_NPU_group: {self.args.tensor_model_parallel_size} \
                         expert_parallel_npu_group: {self.args.expert_model_parallel_size} pp: {self.args.pipeline_model_parallel} \
                         ga: {self.ga_num} all_gpus: {self.args.world_size} checkpoints: 0 checkpoint_initiates: 0"
                     + "\n"
