@@ -6,6 +6,7 @@ import workload_generator.mocked_model.MockedModel
 import workload_generator.mocked_model.inference.MockedDeepSeek as MockedDeepSeek
 import workload_generator.mocked_model.inference.MockedQwen3Moe as MockedQwen3Moe
 import workload_generator.mocked_model.inference.MockedQwen3Next as MockedQwen3Next
+import workload_generator.mocked_model.inference.MockedGLM53Flash as MockedGLM53Flash
 from workload_generator.mocked_model.MockedModel import InferencePhase
 from utils.utils import CommType, get_params, get_comp_out, extract_inference_averages, Strategy, get_ep_expected_m_per_group
 import os
@@ -86,8 +87,11 @@ def _get_model_details(model):
                 or isinstance(model, MockedQwen3Next.Qwen3NextGatedDeltaNet)
                 or isinstance(model, MockedQwen3Next.Qwen3NextRoute)
                 or isinstance(model, MockedQwen3Next.Qwen3NextExpert)
+                or isinstance(model, MockedGLM53Flash.GLM53FlashStage)
             ):
-                layers.append(LayerInfo(model.layer_id, model.name))
+                layer = LayerInfo(model.layer_id, model.name)
+                layer.communication = getattr(model, "communication", None)
+                layers.append(layer)
         for child in model.child_modules():
             traverse_model(child, child_id+1)
 
@@ -99,7 +103,7 @@ class SimAIWorkload():
     def __init__(self, model, args, compue_cache=None):
         self.model = model
         self.args = args
-        self.compute_cache = compute_cache
+        self.compute_cache = compue_cache if compue_cache is not None else {}
         self.workload = []
         self.seq_len = args.seq_length
         self.tp = args.tensor_model_parallel_size
@@ -118,6 +122,8 @@ class SimAIWorkload():
             m = self.batch_size
         elif phase == InferencePhase.PREFILL.value:
             m = self.args.seq_length
+            if isinstance(self.model, MockedGLM53Flash.GLM53FlashModel):
+                m *= self.batch_size
         tp_comm_size = 2 * m * self.args.hidden_size
         ep_combine_size = tp_comm_size * self.topk // self.tp
         ep_dispatch_size = ep_combine_size
@@ -138,7 +144,21 @@ class SimAIWorkload():
 
         for layer in layers:
             name = layer.layer_name
-            if args.tensor_model_parallel_size == 1 :
+            if layer.communication is not None:
+                comm, size = "NONE", 0
+                if layer.communication == "TP" and self.tp > 1:
+                    comm, size = "ALLREDUCE", tp_comm_size
+                elif layer.communication == "EP" and self.expert_model_parallel_size > 1:
+                    comm = "ALLTOALL_EP"
+                    size = ep_dispatch_size if name == "moe_route" else ep_combine_size
+                self.workload.append(Work_Item(
+                    name=f"layer{layer.layer_id}.{name}" if layer.layer_id >= 0 else name,
+                    forward_compute_time=_get_aiob_compute_time(
+                        self.compute_cache, "forward", name, dowarn=False),
+                    forward_comm=comm, forward_comm_size=size,
+                ))
+                continue
+            if self.args.tensor_model_parallel_size == 1 :
                 forward_comm = "NONE"
             else:
                 forward_comm = "ALLREDUCE"
@@ -293,7 +313,10 @@ if __name__ == "__main__":
     model_name = args.model_name
     config_file = args.config_file
     
-    if "Qwen3-Moe" in model_name:
+    if model_name.lower() in ("glm5.3-flash", "glm-5.3-flash"):
+        args = MockedGLM53Flash.GLM53FlashParams(config_file, args)
+        model = MockedGLM53Flash.GLM53FlashModel(args)
+    elif "Qwen3-Moe" in model_name:
         args = MockedQwen3Moe.Qwen3MoeParams(config_file, args)
         model = MockedQwen3Moe.Qwen3MoeModel(args)
     elif "Qwen3-Next" in model_name:

@@ -27,7 +27,7 @@ Usage: $0 [OPTIONS]
 Options:
   -m, --model-size <SIZE>
       Model size to use.
-      Possible values: {deepseek-671B, qwen3-235B, qwen3-next-80B}.
+      Possible values: {deepseek-671B, qwen3-235B, qwen3-next-80B, glm5.3-flash}.
       (Default: $model_size)
 
   -c, --config <FILE>
@@ -127,6 +127,10 @@ do
 done
 
 case $model_size in
+  glm5.3-flash|glm-5.3-flash|GLM-5.3-Flash)
+    model_name=glm5.3-flash
+    config_file_path=${config_file_path:-$SCRIPT_DIR/inference_configs/glm53_flash_default.json}
+    ;;
   deepseek-671B)
     model_name=DeepSeek-671B
     config_file_path=${config_file_path:-$dpsk_default_path}

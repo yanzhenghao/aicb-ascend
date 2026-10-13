@@ -1,0 +1,400 @@
+# GLM-5.3-Flash 接入 AIOB：测量时间类型与操作边界分析
+# 日期：2026-10-13
+# 本文件是计时接口设计说明，不是实测结果，也不是当前解析器可直接消费的 AIOB 文件。
+# 不填写虚构时间；下文的 key 是建议接口名，不代表官方实现的函数名或 kernel 名。
+# 目标：外部计时数据能够完整填入当前文本 decoder 的 446 条 workload 记录。
+# 本文只分析应测量哪些时间及如何使用，不实现 AIOB 文件的生成。
+
+======================================================================
+1. 依据、范围与当前缺口
+======================================================================
+
+# 已读取的第一手资料：
+# [S1] ../../GLMdocs/GLM-5.3-Flash/官方资料/模型配置_config.json
+#      来源：https://huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json
+# [S2] ../../GLMdocs/GLM-5.3-Flash/官方资料/模型卡_README.md
+#      来源：https://huggingface.co/zai-org/GLM-5.3-Flash
+# [S3] docs/glm53_flash_workload.md 记录的模型实现来源：
+#      https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm5_next/modeling_glm5_next.py
+#      本次直接访问 raw 链接失败，未重新逐行核验实现。
+#      下文细分项是根据配置、当前 mock 描述及算子语义提出的测量边界；
+#      融合方式、具体执行顺序和是否存在独立 kernel，仍须在实际测量实现中核对。
+# 本型号参数以 S1 为准，不使用 GLM-5 系列报告替换 Flash 参数，
+# 也不把 Qwen3-Next 的 GatedDeltaNet 计时直接当作本型号 KDA 计时。
+
+# 已核实的文本结构：
+#   45 层，hidden_size=4096。
+#   KDA：34 层，层号 0,1,2,4,5,6,...,40,41,42,44。
+#   DSA：11 层，层号 3,7,11,15,19,23,27,31,35,39,43。
+#   Dense FFN：层 0～2，intermediate_size=12288。
+#   MoE FFN：层 3～44，288 routed experts、top-k=8、1 shared expert，
+#            每个专家 intermediate_size=2048。
+#   mHC：开启，4 个残差流，Sinkhorn 迭代配置为 20，hc_eps=1e-6。
+#   KDA：64 heads、head_dim=128、短卷积 kernel_size=4、gate_lower_bound=-5。
+#   DSA：64 heads、Q rank=1536、KV rank=512、NoPE QK dim=256、V dim=256。
+#   Indexer：32 heads、head_dim=128、top-k=2048、k-pool=4，开启 pool 压缩和尾部选择。
+
+# 代码依据：
+#   workload_generator/mocked_model/inference/MockedGLM53Flash.py
+#   workload_generator/SimAI_inference_workload_generator.py
+#   utils/utils.py::extract_inference_averages
+#   workload_generator/mocked_model/inference/AiobQwen3Next.py
+
+# 当前 extract_inference_averages 仅返回：
+#   attention_norm, attention_gdn, attention_layer, mlp,
+#   moe_norm, moe_route, moe_expert。
+# 当前 GLM workload 的 dense_mlp 和 shared_experts 又都被映射到 mlp。
+# 因此：KDA/DSA 必须分开；dense/shared 必须分开；mHC 与 final_norm 必须补齐。
+# attention_norm、moe_norm、moe_route、moe_expert 可保留概念，但仍须明确测量边界。
+# 当前缺失 key 会静默回退为 1，不能把“文件成功读取”当作“计时完整生效”。
+
+======================================================================
+2. 所有时间类型共同遵循的约定
+======================================================================
+
+# 计时粒度：一个执行 rank 上，一次阶段调用的本地设备执行时间。
+# 不能把全模型累计时间、多个层的时间和、多个 rank 的时间和填进一个阶段。
+# 重复测量取统计值时，先排除编译、初始化、预热等一次性成本，并注明过滤方法。
+# 不以 Python 调用返回时间代替异步设备执行完成时间。
+
+# 单位：建议新接口显式声明 time_unit=us，数值为微秒。
+# 当前 extract_inference_averages 无条件把 time_gpu_avg 乘以 1000；
+# 现有计时链又有不同的数值缩放，接入时必须追踪源数据单位及仿真器消费单位。
+# 在单位核对完成前，不可直接把本设计的微秒值交给旧解析器再乘 1000。
+# 最终写入 workload 的整数值需要明确换算与舍入策略，不能只沿用字段名猜单位。
+
+# Prefill：每个请求处理 S 个输入 token，模型级 token 数 T=B*S。
+# Decode：一次调用只生成一个 token，T=B；历史上下文长度记为 L。
+# B=micro_batch。Decode 的 L 必须单独记录，不能把 query_len=1 当成 KV 长度=1。
+# DSA 成本随历史上下文、稀疏候选和 cache 布局变化；
+# KDA 使用已有循环状态和短卷积历史，其状态长度不按完整 KV 序列增长。
+# Prefill 如为带前缀 cache 的分块预填充，必须同时记录既有上下文长度。
+
+# 输入、权重、累加、cache 的 dtype，FP8 格式、scale 粒度和量化实现都要记录。
+# 官方权重含 FP8 量化配置且有 modules_to_not_convert；不能把所有模块设成 FP8。
+# 本地 GEMM、专家数量、token 分配以实际 TP/EP 切分为准；不能统一把 T 除以 TP。
+# 当前 EP payload 使用按 TP 分摊 token 的抽象，测量实现必须说明是否与它一致。
+
+# 计算计时不包含 ALLREDUCE / ALLTOALL_EP：这些通信已作为 workload 独立字段表达。
+# pack、scatter、gather 等本地数据整理仍有成本，应归入明确的计算阶段。
+# 若生产 kernel 将计算和通信融合，必须标注不可分离部分并调整建模口径，
+# 否则将端到端融合时间与现有通信字段相加会重复计费。
+# shared expert 与 routed expert、不同 kernel 若存在并发，不能直接相加当作墙钟延迟。
+# 现有 workload 按串行阶段表达；应声明串行近似，或另行扩展重叠调度表达。
+
+======================================================================
+3. 最小完整接口：14 种阶段时间，直接对应现有 workload
+======================================================================
+
+# 这 14 种是完整覆盖现有输出所需的阶段类型，不要求拆成 14 个独立 kernel。
+# 每种类型可按 layer_id 提供多个时间；类型数不等于计时数值总数。
+# 取值建议：先找 layerN.<stage>，没有逐层值时再使用 <stage> 的代表层值。
+# 当前实现尚未支持这种逐层优先查找，需要接入时增加。
+
+hc_attn_pre
+# 操作：注意力分支之前的 mHC 处理；从 4 个残差流构造当前分支输入，
+# 并计算分支/残差混合所需的动态系数。若实现将系数生成与流压缩融合，整体测量。
+# 应覆盖该 pre 调用内的映射、归一化、门控/矩阵约束和加权流聚合。
+# 不包含随后 attention_norm、注意力计算或 post 应用。
+# mHC pre 中生成并在 post 中使用的系数，生成成本只记在 pre，不能重复计入 post。
+# 映射：layerN.hc_attn_pre；出现 45 次；本地计算，无新增 collective。
+
+attention_norm
+# 操作：注意力前的 RMSNorm；按 hidden dimension 计算均方、加 eps、
+# 取倒平方根，并按归一化权重缩放。文本 rms_norm_eps=1e-5。
+# 输入是 mHC pre 产生的分支输入，通常以 hidden_size=4096 为归一化维度。
+# 不包含 KDA 内部 gated RMSNorm、DSA 的低秩 latent norm 或 final_norm。
+# 映射：layerN.attention_norm；出现 45 次；可延续现有 atten_norm 输入语义。
+
+attention_kda
+# 操作：完整 KDA 线性注意力阶段，覆盖 Q/K/V 投影、短卷积、forget/beta/输出门控、
+# KDA 状态更新及读出、内部 gated RMSNorm、输出投影，以及所需本地布局转换。
+# KDA 使用逐通道衰减/遗忘控制，不能用普通 full attention 或 Qwen GDN 总时间替代。
+# Prefill 要覆盖序列上的 chunk/scan 计算；decode 要覆盖已有状态上的单步更新。
+# 不包含外侧 attention_norm、mHC 或输出后的 TP ALLREDUCE。
+# 映射：layerN.attention_kda；出现 34 次；新增独立时间类型。
+
+attention_dsa
+# 操作：完整 DeepSeek sparse attention 阶段，覆盖低秩 Q/KV 投影、内部 norm、
+# indexer 候选选择、k-pool 相关处理、NoPE MLA 稀疏注意力、cache 访问及输出投影。
+# text_config 的 qk_rope_head_dim=0 且 mla_use_nope=true；
+# 不应机械增加普通主 Q/K RoPE 的时间。Indexer 的位置处理须单独核对实现。
+# Decode 必须基于长度 L 的历史 cache；top-k 不可超过实现可用的候选数量。
+# 不包含外侧 attention_norm、mHC 或输出后的 TP ALLREDUCE。
+# 映射：layerN.attention_dsa；出现 11 次；新增独立时间类型。
+
+hc_attn_post
+# 操作：将注意力分支输出注入/广播到残差流，并用 pre 已生成的混合系数
+# 对残差流做重组与相加。测量本地读写、矩阵/加权混合及融合残差应用。
+# 不再次计算已在 hc_attn_pre 计费的系数；不包含注意力输出 collective。
+# 映射：layerN.hc_attn_post；出现 45 次；新增独立时间类型。
+
+hc_ffn_pre
+# 操作：FFN 分支前的 mHC 处理，与 hc_attn_pre 的功能类别类似，
+# 但使用 FFN 分支对应的参数/系数并作用于注意力 post 后的残差流。
+# 单独测量或验证与 attention pre 等价后共享代表值，不能直接假定时间相同。
+# 不包含 moe_norm、dense FFN 或 MoE。
+# 映射：layerN.hc_ffn_pre；出现 45 次；新增独立时间类型。
+
+moe_norm
+# 操作：FFN 前的 RMSNorm，即 post_attention_layernorm 对应归一化。
+# 虽然阶段名含 moe，它在前三个 dense 层也出现，不能只给 MoE 层填值。
+# 不包含 router softmax/sigmoid、专家激活或 mHC pre。
+# 映射：layerN.moe_norm；出现 45 次；保留已有类型并明确适用层。
+
+dense_mlp
+# 操作：前三层的完整 dense FFN：gate/up 投影、SwiGLU 类门控激活与乘法、
+# down 投影。hidden_size=4096，intermediate_size=12288。
+# 官方配置 hidden_act=silu、swiglu_limit=10；实际限幅放置与融合方式须核对实现。
+# 包括阶段内必要的量化/反量化、转置等本地成本；不包含输出 TP ALLREDUCE。
+# 映射：layer0～2.dense_mlp；出现 3 次。
+# 必须有自己的 key，不能与 intermediate_size=2048 的 shared expert 共用 mlp 值。
+
+moe_route
+# 操作：从输入计算 288 个专家的路由分数，进行专家选择、权重处理，
+# 并完成 dispatch 前的本地 token 分桶、排序、计数和打包。
+# 配置 scoring_func=sigmoid、topk_method=noaux_tc、top-k=8、
+# norm_topk_prob=true、routed_scaling_factor=2.5、router dtype=float32。
+# n_group=1、topk_group=1；不要套用多组筛选的额外成本。
+# 选择用分数与最终合并用权重的处理位置应按实际实现，不能把二者混为一次 top-k。
+# 不包含网络 ALLTOALL_EP；如打包由通信库计费，需要说明并从这里扣除相应成本。
+# 映射：layer3～44.moe_route；出现 42 次；保留已有类型并补齐本地整理边界。
+
+moe_expert
+# 操作：本 rank routed experts 的 gate/up GEMM、SwiGLU 激活、down GEMM，
+# 以及接收 token 后的本地解包/重排、路由权重应用与结果归并。
+# 实际专家 token 数可能很不均匀；需记录每个专家负载，不能只使用平均 token 数。
+# EP 下通常只测本 rank 分配到的 routed experts，不能测全 288 个专家后再复制到各 rank。
+# 不包含 dispatch/combine 的网络 ALLTOALL_EP，也不包含 shared expert。
+# 当前行的通信字段表达 combine；归并若发生在 combine 后，应记录实际顺序。
+# 当前单行“计算+通信”表达无法完整表达两侧本地处理时，需拆阶段或注明近似。
+# 映射：layer3～44.moe_expert；出现 42 次；保留已有类型并明确计时范围。
+
+shared_experts
+# 操作：独立共享专家 FFN，对全部输入 token 执行 gate/up、SwiGLU、down，
+# intermediate_size=1*2048。它不经过 top-k token 筛选，也不属于 288 个 routed experts。
+# 当前 mock 假设共享专家复制执行，不新增 TP collective；计时应匹配这一执行策略。
+# 若部署实现将它分片或与 routed experts 并发，须记录差异并调整通信/重叠模型。
+# 不可复用前三层 intermediate_size=12288 的 dense_mlp 时间。
+# 映射：layer3～44.shared_experts；出现 42 次；新增独立 key，替换共用 mlp 查找。
+
+hc_ffn_post
+# 操作：将 dense/MoE 的 FFN 分支结果写回 4 个残差流，执行残差混合与相加。
+# Routed/shared 两路输出的求和若在此调用内发生，应明确计入此处；
+# 若已在专家阶段计入，则这里不再重复计费。
+# 不包含已在 hc_ffn_pre 生成的系数成本，也不包含专家网络通信。
+# 映射：layerN.hc_ffn_post；出现 45 次；新增独立时间类型。
+
+hc_head
+# 操作：decoder 末尾的 hyper-connection head，将多残差流转换为最终单流表示。
+# 包括实现中对应的权重/门控计算与流加权归约，输出送入 final_norm。
+# 这是残差流收束操作，不是词表输出 LM head，不包含 logits GEMM。
+# 映射：hc_head；出现 1 次；新增独立时间类型。
+
+final_norm
+# 操作：所有 decoder 层及 hc_head 之后，对最终 hidden states 做 RMSNorm。
+# 不包含最后词表投影、采样、tokenizer 或设备到主机拷贝。
+# 若部署 prefill 仅对最后 token 执行最终处理，应记录 token 数差异，
+# 并核对是否与当前 workload 的阶段范围一致。
+# 映射：final_norm；出现 1 次；新增独立时间类型。
+
+# 覆盖校验：
+#   mHC 四阶段 + 两个外部 norm：6*45=270 条。
+#   attention_kda + attention_dsa：34+11=45 条。
+#   dense_mlp：3 条。
+#   moe_route + moe_expert + shared_experts：3*42=126 条。
+#   hc_head + final_norm：2 条。
+#   总计 270+45+3+126+2=446 条。
+# 相对现有解析器可复用的 4 个类型（两个 norm、route、expert），
+# 完整阶段接口还需要 10 个独立 key，其中 dense_mlp 是将旧 mlp 语义显式拆分。
+
+======================================================================
+4. 建议的细粒度诊断时间：帮助核对阶段总时间
+======================================================================
+
+# 以下项目按需采集，不要求当前 workload 每项新增一行。
+# 推荐优先测上节完整阶段时间，细项用于定位成本与核对遗漏。
+# 若使用细项求阶段总时间，细项必须不重叠且覆盖全部执行；
+# 若已测完整阶段，不能再把这些细项加到完整阶段上。
+# 融合 kernel 可以只提供联合时间；不得将同一个融合时间同时填入多个细项。
+
+4.1 KDA 内部建议项 -> attention_kda
+
+kda_qkv_proj
+# 将 hidden states 线性映射到 Q/K/V，包含实际 fused/unfused 路径的本地投影成本。
+# 每种 head 总维度按配置为 64*128；TP 后形状以实际切分为准。
+# 如 fused_qkvbfg_a_proj 同时生成门控中间量，应扩大该项边界，避免下项重复测量。
+kda_short_conv
+# Q/K/V 的因果短卷积与实际附带激活，kernel_size=4。
+# Prefill 覆盖序列卷积；decode 覆盖历史窗口读取、单步计算和卷积状态更新。
+kda_forget_gate
+# 生成逐通道遗忘/衰减控制量，包含对应投影和非线性/参数变换。
+# gate_lower_bound=-5 是配置事实；具体变换公式应以实际 KDA 实现为准。
+kda_beta_gate
+# 生成 delta 更新所需的 beta/更新强度，不等同于 forget gate 或输出门控。
+kda_qk_prepare
+# 实现需要的 Q/K 归一化、缩放及进入状态 kernel 前的本地布局准备。
+# 是否有独立归一化 kernel 须核对实现；若融合在 core 中则不另加时间。
+kda_core
+# 使用 Q/K/V、衰减和 beta 执行 delta 状态更新及注意力输出读出。
+# Prefill 使用实际 chunk/scan 算法；decode 使用已有状态的单步算法。
+# 包括该 kernel 内部状态读写；不能另将同一状态更新计费一次。
+kda_output_gate_norm
+# 生成/应用输出门控，并执行该线性注意力内部的 sigmoid gated RMSNorm。
+# 与 layer 的 attention_norm 不同，应计入 attention_kda。
+kda_out_proj
+# 将多头输出投影回 hidden_size=4096，含必要本地布局处理；不含 TP ALLREDUCE。
+kda_local_overhead
+# 仅记录上述项未覆盖的本地转置、contiguous、cache 更新等设备操作。
+# 必须列出具体操作，不能填任意补偿值；已融合/已覆盖的操作不再计入。
+
+4.2 DSA 内部建议项 -> attention_dsa
+
+dsa_q_down_proj
+# Q 的低秩降维投影，hidden 4096 -> q_lora_rank 1536。
+dsa_q_latent_norm
+# 对低秩 Q latent 做内部归一化；不是外部 attention_norm。
+dsa_q_up_proj
+# 从 Q latent 形成各头 query；NoPE QK head dim=256，实际 TP 形状按实现。
+dsa_kv_down_proj
+# 将输入压缩成 kv_lora_rank=512 的 KV latent，含实际 cache 表示准备。
+dsa_kv_latent_norm
+# KV latent 的内部归一化，不与 Q latent norm 共用时间假设。
+dsa_kv_materialize_or_absorb
+# 根据执行路径测量 KV 升维/展开，或 MLA 权重吸收后的等价投影。
+# Materialize 与 absorb 是执行路径选择，不能把两种替代路径全部求和。
+dsa_index_proj
+# Indexer 自身 query/key/权重等投影与必要的本地变换。
+# Indexer 有 32 heads、head_dim=128，不能直接复用主 attention 投影时间。
+dsa_index_position
+# 仅在实际 indexer 执行位置编码/旋转变换时计时。
+# indexer_rope_interleave=true 不代表主 NoPE MLA 也需要 RoPE。
+# 具体位置处理、维度和调用是否存在，须核对实际实现后确定。
+dsa_kpool_prepare
+# 准备 k-pool 压缩/分组表示及其缓存，pool=4，index_kpool_compress=true。
+# 具体压缩、布局和重用范围依实现；不能假定每步重算整个历史池。
+dsa_index_score
+# 在实际候选池上计算 indexer 分数并进行实现要求的 head 聚合等处理。
+# 必须包含因果/有效长度处理，避免 prefill 把未来 token 当成合法候选。
+dsa_index_select
+# 根据分数进行 top-k 候选选择、索引整理和尾部候选合并。
+# index_topk=2048、always_select_tail=true；实际候选数和去重策略须记录。
+dsa_sparse_core
+# 对选定 token 执行主 attention 的打分、缩放/softmax 和 value 加权聚合，
+# 或测等价的融合 sparse MLA kernel。短序列退化路径应单独标明。
+# 不再次包含已计费的 indexer 分数与 top-k。
+dsa_cache_layout
+# 上述项未覆盖的 latent/index cache 写入、按索引 gather、布局转换。
+# 如果 gather 已在 sparse core 中完成，则不另计相同内存操作。
+dsa_out_proj
+# 将 sparse attention 输出投影回 hidden_size；不含 TP ALLREDUCE。
+
+4.3 Dense、routed expert、shared expert 的 FFN 细项
+
+dense_gate_up / dense_activation / dense_down
+# 分别是 intermediate_size=12288 的 gate/up 投影、SwiGLU 及实际限幅、down 投影。
+# gate 与 up 融合时测联合时间；含量化 GEMM 的 scale 成本需要归入所属投影。
+shared_gate_up / shared_activation / shared_down
+# 与 dense 三项算子类别类似，但 intermediate_size=2048、token 集合和并行策略不同。
+# 应独立测量；不能按维度比例线性缩放 dense 的时间代替实测。
+route_logits
+# hidden -> 288 专家分数的 router 投影，记录 router FP32 的实际转换与累加路径。
+route_select_weights
+# sigmoid、专家选择用处理、top-k=8、最终权重归一化与 scaling 等实际操作。
+# noaux_tc 中选择分数与输出权重的具体关系须按实现核实。
+route_local_pack
+# dispatch 前本地 token 排序、按专家分桶、计数/offset、重排与发送缓冲准备。
+# 不含跨 rank 传输；边界与所用通信库的 pack 计时保持一致。
+expert_local_unpack
+# dispatch 后按本地专家排列 token，准备 grouped GEMM 输入；不含网络接收等待。
+expert_gate_up / expert_activation / expert_down
+# 本 rank routed experts 的 grouped/逐专家 FFN 运算，intermediate_size=2048。
+# 测量输入需保留实际 token 分布，包含空专家、小批量专家及 padding 策略。
+expert_local_merge
+# 按路由权重缩放、inverse permutation、scatter-add/合并 top-k 输出等本地操作。
+# 其中发生在 combine 后的部分需明确标出，必要时拆分 workload 阶段。
+ffn_branch_sum
+# Routed 与 shared 两路结果的本地求和。只能归入 moe_expert、shared_experts
+# 或 hc_ffn_post 中一个明确归属，不能三处重复计费。
+
+4.4 mHC 与 norm 的细项
+
+hc_attn_coeff / hc_ffn_coeff
+# 生成各分支的混合系数，覆盖实际映射、归一化和门控等操作。
+# 仅按真实实现拆分，不能假定每一步都有独立 kernel。
+hc_attn_sinkhorn / hc_ffn_sinkhorn
+# 对残差混合矩阵执行 Sinkhorn 行/列归一化，使其满足 mHC 所需约束。
+# 配置迭代次数 20、hc_eps=1e-6；测全部实际迭代，不只测一次归一化。
+# 若此过程已融合在 coeff 时间里，应只保留一个计时值。
+hc_attn_reduce / hc_ffn_reduce
+# 从 4 个残差流加权形成分支输入，计入对应 pre。
+hc_attn_apply / hc_ffn_apply
+# 将分支输出与残差流混合并写回，计入对应 post。
+hc_head_coeff / hc_head_reduce
+# 最后残差流收束时实际执行的系数计算和加权归约，合并为 hc_head。
+attention_norm / moe_norm / final_norm
+# 三种 norm 可以保持整体计时，不必把平方、归约、rsqrt、乘法再拆开。
+# 若 residual add 与 norm 融合，要注明 residual add 属于哪个阶段并避免重复计费。
+
+======================================================================
+5. 文件接口、元数据与完整性要求
+======================================================================
+
+# 建议继续支持“节名 + time_gpu_avg”的外部形式，但增加显式格式版本与单位。
+# 文件节名与第 3 节阶段名保持一致；支持 layerN.stage 需要更新当前正则：
+# 现有 ^(\w+): 不支持点号，且只会把固定类别累加到旧 cache。
+# 不能仅新增节名而继续使用按 atten/mlp/moe 子串分类的逻辑。
+# 阶段总时间与细项时间应分开命名/存储，并规定优先级，禁止同时求和。
+
+# 格式示意（占位符不是有效数值，不能直接拿去跑仿真）：
+#   timing_schema: glm53_flash_v1
+#   time_unit: us
+#   inference_term: decode
+#   attention_kda:
+#       time_gpu_avg: <单个代表层、单次调用的实测值>
+#   layer3.attention_dsa:
+#       time_gpu_avg: <第 3 层、单次调用的实测值>
+# 如实现通用正则解析，元数据不能被误认为计时节；推荐明确解析 schema。
+
+# 文件头或配套元数据至少记录：
+#   精确模型名、配置来源/版本、测量实现版本、设备型号与 kernel/backend 版本；
+#   phase、batch、query length、KV/context length、是否带前缀；
+#   TP/EP/PP/world size、rank、分片策略、专家负载与路由策略；
+#   dtype、权重量化、cache dtype、计时单位、暖机与重复次数、统计方法；
+#   测量是否包含本地数据整理、cache 写入、通信，以及是否使用并发/融合。
+# rank 负载不均时，要保留逐 rank 数据；若只用代表值，明确均值/最大值选择理由。
+
+# 建议完整性检查：
+#   显式提供计时文件时，检查本 workload 使用的每个阶段均有有效时间。
+#   缺项报告完整层名与阶段名；不继续静默把大量阶段填成 1。
+#   合法的 0、未执行、缺失要区分，不能沿用旧解析器“删除所有 0 值”的策略。
+#   检查负值、NaN、无穷值、重复 key、单位不明和元数据配置不匹配。
+#   若选择宽松模式，输出缺失阶段列表和占位数量，让使用者知道哪些成本没测。
+
+======================================================================
+6. 接入改动与验收重点
+======================================================================
+
+# A. utils/utils.py：增加 GLM53 的显式计时 schema/阶段映射，保留其他模型旧解析兼容；
+#    拆开 KDA/DSA、dense/shared，补齐 mHC/final_norm，处理单位和逐层 key。
+# B. SimAI_inference_workload_generator.py：增加显式计时文件路径入口，
+#    时间查询优先使用完整层名，再用阶段代表值，统计缺失项并执行完整性检查。
+# C. MockedGLM53Flash 参数透传：如新增 comp_filepath 等参数，需要加入允许覆盖列表；
+#    仅在 parser 增加选项而不透传到 Params，会导致后续无法访问该参数。
+# D. scripts/inference_workload_with_aiob.sh：透传已有文件路径和相关模式选项。
+# E. 保留 --aiob_enable 的“运行测量模型”语义；读已有文件无需解除当前生成路径限制。
+#    本设计没有为 GLM53 实现实际 AIOB 测量模型。
+
+# 验收应使用人为指定、各阶段互不相同的已知时间验证映射，不冒充性能数据：
+#   1. prefill/decode 都能将 14 类型填入对应的全部 446 行。
+#   2. KDA 与 DSA、dense 与 shared、四种 mHC 和 final_norm 不混淆。
+#   3. layer3.attention_dsa 能覆盖阶段代表值，其他 DSA 层仍使用代表值。
+#   4. 计时单位只转换一次，缺项/非法值/配置不一致能被准确识别。
+#   5. 输入计时不改变原有层序、TP/EP 通信类型和 payload。
+#   6. 保留无文件时使用占位值的已有测试，并新增实际文件输入的验证场景。
+#   7. 确认其他模型的旧 AIOB 文件仍能按原有路径解析。
+
+# 当前范围外的可选计时：视觉编码器、embedding、词表 LM head、采样、MTP、
+# 主机调度和请求排队。这些在当前 446 行中没有对应阶段。
+# 若将目标扩大为完整多模态服务或端到端生成延迟，须新增 workload 阶段，
+# 不能把这些成本塞进 attention_kda、attention_dsa 或 hc_head。
